@@ -224,7 +224,7 @@ async function handleApi(req, res, url) {
       const [, compactDate, league] = fixtureMatch;
       const date = `${compactDate.slice(0,4)}-${compactDate.slice(4,6)}-${compactDate.slice(6,8)}`;
       const events = await sportScoreFixtures(date, league);
-      return json(res, 200, { events, source:'SportScore', generatedAt:new Date().toISOString(), attribution:'https://sportscore.com/' });
+      return json(res, 200, { events, errors:[], source:'SportScore', generatedAt:new Date().toISOString(), attribution:'https://sportscore.com/' });
     }
     if (p === '/api/search') {
       const q = (url.searchParams.get('q') || '').trim();

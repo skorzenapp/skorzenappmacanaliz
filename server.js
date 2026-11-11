@@ -104,23 +104,38 @@ function scoreNum(v) {
   const n = Number(v); return Number.isFinite(n) ? n : null;
 }
 function normalizeFixture(x, leagueSlug) {
-  const homeName = x.home || x.home_team || x.home_name || x.homeTeam?.name || 'Ev sahibi';
-  const awayName = x.away || x.away_team || x.away_name || x.awayTeam?.name || 'Deplasman';
+  const teamValue = (value, fallback) => {
+    if (value && typeof value === 'object') {
+      return String(value.name || value.display_name || value.short_name || value.title || fallback);
+    }
+    return value == null || value === '' ? fallback : String(value);
+  };
+  const homeSource = x.home || x.home_team || x.home_name || x.homeTeam;
+  const awaySource = x.away || x.away_team || x.away_name || x.awayTeam;
+  const homeName = teamValue(homeSource, 'Ev sahibi');
+  const awayName = teamValue(awaySource, 'Deplasman');
+  const competitionValue = x.competition || x.league || null;
+  const competitionName = competitionValue && typeof competitionValue === 'object'
+    ? (competitionValue.name || competitionValue.title || 'football')
+    : (competitionValue || 'football');
   const slug = x.slug || x.match_slug || x.url_slug || `${slugify(homeName)}-vs-${slugify(awayName)}`;
-  const statusRaw = String(x.status || x.state || '').toLowerCase();
+  const statusValue = x.status && typeof x.status === 'object'
+    ? (x.status.name || x.status.short || x.status.type || '')
+    : (x.status || x.state || '');
+  const statusRaw = String(statusValue).toLowerCase();
   const state = /live|in.?play|1h|2h|half|ht|extra|pen/.test(statusRaw) ? 'in' :
     /finished|complete|full.?time|ft|ended|post/.test(statusRaw) ? 'post' : 'pre';
-  const homeScore = scoreNum(x.home_score ?? x.homeScore);
-  const awayScore = scoreNum(x.away_score ?? x.awayScore);
-  const time = x.time || x.kickoff || x.datetime || x.date || null;
+  const homeScore = scoreNum(x.home_score ?? x.homeScore ?? x.scores?.home);
+  const awayScore = scoreNum(x.away_score ?? x.awayScore ?? x.scores?.away);
+  const time = x.time || x.kickoff || x.datetime || x.date || x.starting_at || null;
   return {
-    id: slug, slug, league: leagueSlug || slugify(x.competition || x.league || 'football'),
-    name: x.status_text || x.statusText || x.status || '',
+    id: slug, slug, league: leagueSlug || slugify(competitionName),
+    name: x.status_text || x.statusText || statusValue || '',
     date: time, dateUtc: time, generatedAt: new Date().toISOString(),
-    home: { id: slugify(x.home_slug || homeName), name: homeName, short: homeName, logo: x.home_logo || x.homeLogo || null, score: homeScore },
-    away: { id: slugify(x.away_slug || awayName), name: awayName, short: awayName, logo: x.away_logo || x.awayLogo || null, score: awayScore },
+    home: { id: slugify(x.home_slug || homeName), name: homeName, short: homeName, logo: x.home_logo || x.homeLogo || x.homeTeam?.logo || null, score: homeScore },
+    away: { id: slugify(x.away_slug || awayName), name: awayName, short: awayName, logo: x.away_logo || x.awayLogo || x.awayTeam?.logo || null, score: awayScore },
     status: { state, completed: state === 'post', clock: x.minute || x.clock || x.status_text || null },
-    competition: x.competition || x.league || null,
+    competition: competitionName === 'football' ? null : competitionName,
     source: 'SportScore'
   };
 }

@@ -1,0 +1,13 @@
+{
+  "name": "skorzen-football",
+  "version": "1.0.0",
+  "private": true,
+  "description": "SKORZEN football analytics with live scores, Poisson estimates, favorites and locally saved analysis reports",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -1,419 +1,489 @@
+// Maç Analiz — sunucu. Bağımlılık yok, Node 18+ yeterli.
+// Arayüzü (public/) sunar, /api/* isteklerini ESPN açık futbol verisinden üretir.
 'use strict';
+const http = require('http');
+const fs = require('fs');
+const path = require('path');
+const zlib = require('zlib');
 
-const http = require('node:http');
-const fs = require('node:fs');
-const path = require('node:path');
-const { URL } = require('node:url');
+const PORT = process.env.PORT || 5000;
+const PUBLIC = path.join(__dirname, 'public');
+const ESPN = 'https://site.api.espn.com/apis/site/v2/sports/soccer';
+const ESPN_V2 = 'https://site.api.espn.com/apis/v2/sports/soccer';
+const ESPN_SEARCH = 'https://site.web.api.espn.com/apis/common/v3/search';
 
-const ROOT = __dirname;
-// Load a local .env file without adding a runtime dependency. Existing process env wins.
-try {
-  const envText = fs.readFileSync(path.join(ROOT, '.env'), 'utf8');
-  for (const line of envText.split(/\r?\n/)) {
-    const match = line.match(/^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*?)\s*$/);
-    if (match && process.env[match[1]] === undefined) process.env[match[1]] = match[2].replace(/^(['"])(.*)\1$/, '$2');
+const LEAGUES = ['tur.1','tur.2','eng.1','eng.2','esp.1','esp.2','ita.1','ita.2','ger.1','ger.2','fra.1','fra.2',
+  'ned.1','ned.2','por.1','bel.1','aut.1','sui.1','swe.1','ksa.1','bra.1','arg.1','col.1','mex.1','usa.1','aus.1',
+  'kor.1','jpn.1','den.1','nor.1','chn.1','sco.1','chi.1'];
+const LEAGUE_OK = new Set(LEAGUES);
+const UI_LEAGUES = LEAGUES.slice(0, 27); // arayüzün tanıdığı ligler; 'Tüm ligler'de sadece bunlar
+
+/* ---------- ağ + önbellek ---------- */
+const cache = new Map();            // url -> {t, ttl, p}
+let active = 0; const queue = [];
+const MAX_PAR = 8;
+function slot() { return new Promise(res => { if (active < MAX_PAR) { active++; res(); } else queue.push(res); }); }
+function release() { const n = queue.shift(); if (n) n(); else active--; }
+
+async function rawFetch(url) {
+  if (process.env.ESPN_MOCK) url = url.replace(/^https:\/\/[^/]+/, process.env.ESPN_MOCK);
+  for (let attempt = 0; attempt < 2; attempt++) {
+    await slot();
+    try {
+      const ctl = new AbortController();
+      const to = setTimeout(() => ctl.abort(), 20000);
+      const r = await fetch(url, { signal: ctl.signal, headers: { 'user-agent': 'Mozilla/5.0 mac-analiz', accept: 'application/json' } });
+      clearTimeout(to);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      return await r.json();
+    } catch (e) {
+      if (attempt === 1) throw e;
+    } finally { release(); }
   }
-} catch {}
-const PORT = Number(process.env.PORT || 3000);
-const SPORTMONKS_TOKEN = process.env.SPORTMONKS_API_TOKEN || '';
-const CACHE = new Map();
-const CACHE_TTL = 60_000;
-const UPSTREAM_TIMEOUT_MS = 12_000;
-const SPORTScore = 'https://sportscore.com';
-const APP_VERSION = '1.2.0';
+}
+function getJSON(url, ttlMs = 5 * 60 * 1000) {
+  const hit = cache.get(url);
+  if (hit && Date.now() - hit.t < hit.ttl) return hit.p;
+  const p = rawFetch(url);
+  cache.set(url, { t: Date.now(), ttl: ttlMs, p });
+  p.catch(() => cache.delete(url));
+  return p;
+}
+const memo = new Map();
+function memoAsync(key, ttlMs, fn) {
+  const hit = memo.get(key);
+  if (hit && Date.now() - hit.t < ttlMs) return hit.p;
+  const p = fn(); memo.set(key, { t: Date.now(), p });
+  p.catch(() => memo.delete(key));
+  return p;
+}
+setInterval(() => { // önbellek temizliği
+  const now = Date.now();
+  for (const [k, v] of cache) if (now - v.t > Math.max(v.ttl, 3600e3) * 2) cache.delete(k);
+  for (const [k, v] of memo) if (now - v.t > 24 * 3600e3) memo.delete(k);
+}, 30 * 60 * 1000).unref();
 
-function json(res, status, data) {
-  res.writeHead(status, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Cache-Control': 'no-store',
-    'X-Content-Type-Options': 'nosniff'
-  });
-  res.end(JSON.stringify(data));
-}
-function fail(res, status, code, message, extra = {}) {
-  return json(res, status, { error: code, message, ...extra });
-}
-function cacheRead(key) {
-  const item = CACHE.get(key);
-  if (!item) return null;
-  if (Date.now() - item.at > CACHE_TTL) { CACHE.delete(key); return null; }
-  return item.value;
-}
-function cacheWrite(key, value) {
-  if (CACHE.size > 500) CACHE.delete(CACHE.keys().next().value);
-  CACHE.set(key, { at: Date.now(), value });
-}
+/* ---------- yardımcılar ---------- */
+const num = v => { if (v == null || v === '') return null; const n = Number(String(v).replace(/[^0-9.\-]/g, '')); return Number.isFinite(n) ? n : null; };
+const ymd = d => `${d.getUTCFullYear()}${String(d.getUTCMonth() + 1).padStart(2, '0')}${String(d.getUTCDate()).padStart(2, '0')}`;
+const logoOf = t => t?.logo || t?.logos?.[0]?.href || null;
 
-async function getJson(url, cacheKey = url.toString()) {
-  const cached = cacheRead(cacheKey);
-  if (cached) return cached;
-  const response = await fetch(url, {
-    headers: { Accept: 'application/json', 'User-Agent': 'SKORZEN-Football-App/0.9' },
-    signal: AbortSignal.timeout(UPSTREAM_TIMEOUT_MS)
-  });
-  const raw = await response.text();
-  let data;
-  try { data = raw ? JSON.parse(raw) : {}; }
-  catch { throw Object.assign(new Error('Veri sağlayıcısı geçerli JSON döndürmedi.'), { status: 502, code: 'INVALID_UPSTREAM_JSON' }); }
-  if (!response.ok) {
-    throw Object.assign(new Error(data?.message || `Veri sağlayıcısı HTTP ${response.status} yanıtı verdi.`), {
-      status: response.status === 429 ? 429 : 502,
-      code: response.status === 429 ? 'UPSTREAM_RATE_LIMIT' : 'UPSTREAM_ERROR'
-    });
-  }
-  cacheWrite(cacheKey, data);
-  return data;
+function statusOf(st) {
+  const t = st?.type || {};
+  return { state: t.state || 'pre', name: t.name || '', clock: st?.displayClock || '', completed: !!t.completed };
 }
-
-function sportScoreUrl(endpoint, params = {}) {
-  const url = new URL(`${SPORTScore}${endpoint}`);
-  url.searchParams.set('src', 'skorzen');
-  for (const [key, value] of Object.entries(params)) {
-    if (value !== undefined && value !== null && String(value).trim() !== '') url.searchParams.set(key, String(value));
-  }
-  return url;
-}
-
-
-
-// Compatibility adapter: the original Maç Analiz UI expects ESPN-shaped routes.
-// SportScore is the licensed/attribution-based provider used by this package.
-const LEAGUE_MAP = {
-  'tur.1':'super-lig', 'eng.1':'premier-league', 'eng.2':'championship',
-  'esp.1':'la-liga', 'esp.2':'segunda-division', 'ita.1':'serie-a',
-  'ita.2':'serie-b', 'ger.1':'bundesliga', 'ger.2':'2-bundesliga',
-  'fra.1':'ligue-1', 'fra.2':'ligue-2', 'ned.1':'eredivisie',
-  'ned.2':'eerste-divisie', 'por.1':'primeira-liga', 'bel.1':'pro-league',
-  'aut.1':'austrian-bundesliga', 'sui.1':'swiss-super-league',
-  'swe.1':'allsvenskan', 'ksa.1':'saudi-pro-league', 'bra.1':'serie-a-brazil',
-  'arg.1':'liga-profesional-argentina', 'col.1':'primera-a-colombia',
-  'mex.1':'liga-mx', 'usa.1':'mls', 'aus.1':'a-league'
-};
-const slugify = s => String(s || '').normalize('NFKD').replace(/[\u0300-\u036f]/g,'')
-  .toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
-function unwrapArray(payload) {
-  if (Array.isArray(payload)) return payload;
-  for (const k of ['fixtures','matches','events','data','results']) {
-    if (Array.isArray(payload?.[k])) return payload[k];
-    if (Array.isArray(payload?.data?.[k])) return payload.data[k];
-  }
-  return [];
-}
-function scoreNum(v) {
-  if (v === null || v === undefined || v === '') return null;
-  const n = Number(v); return Number.isFinite(n) ? n : null;
-}
-function normalizeFixture(x, leagueSlug) {
-  const teamValue = (value, fallback) => {
-    if (value && typeof value === 'object') {
-      return String(value.name || value.display_name || value.short_name || value.title || fallback);
-    }
-    return value == null || value === '' ? fallback : String(value);
-  };
-  const homeSource = x.home || x.home_team || x.home_name || x.homeTeam;
-  const awaySource = x.away || x.away_team || x.away_name || x.awayTeam;
-  const homeName = teamValue(homeSource, 'Ev sahibi');
-  const awayName = teamValue(awaySource, 'Deplasman');
-  const competitionValue = x.competition || x.league || null;
-  const competitionName = competitionValue && typeof competitionValue === 'object'
-    ? (competitionValue.name || competitionValue.title || 'football')
-    : (competitionValue || 'football');
-  const slug = x.slug || x.match_slug || x.url_slug || `${slugify(homeName)}-vs-${slugify(awayName)}`;
-  const statusValue = x.status && typeof x.status === 'object'
-    ? (x.status.name || x.status.short || x.status.type || '')
-    : (x.status || x.state || '');
-  const statusRaw = String(statusValue).toLowerCase();
-  const state = /live|in.?play|1h|2h|half|ht|extra|pen/.test(statusRaw) ? 'in' :
-    /finished|complete|full.?time|ft|ended|post/.test(statusRaw) ? 'post' : 'pre';
-  const homeScore = scoreNum(x.home_score ?? x.homeScore ?? x.scores?.home);
-  const awayScore = scoreNum(x.away_score ?? x.awayScore ?? x.scores?.away);
-  const time = x.time || x.kickoff || x.datetime || x.date || x.starting_at || null;
+function teamOf(c) {
+  const t = c.team || {};
+  const rec = c.records?.[0]?.summary || c.record?.[0]?.displayValue || c.record?.[0]?.summary || null;
   return {
-    id: slug, slug, league: leagueSlug || slugify(competitionName),
-    name: x.status_text || x.statusText || statusValue || '',
-    date: time, dateUtc: time, generatedAt: new Date().toISOString(),
-    home: { id: slugify(x.home_slug || homeName), name: homeName, short: homeName, logo: x.home_logo || x.homeLogo || x.homeTeam?.logo || null, score: homeScore },
-    away: { id: slugify(x.away_slug || awayName), name: awayName, short: awayName, logo: x.away_logo || x.awayLogo || x.awayTeam?.logo || null, score: awayScore },
-    status: { state, completed: state === 'post', clock: x.minute || x.clock || x.status_text || null },
-    competition: competitionName === 'football' ? null : competitionName,
-    source: 'SportScore'
+    id: String(t.id), name: t.displayName || t.name || '?', short: t.shortDisplayName || t.displayName || t.name || '?',
+    abbr: t.abbreviation || (t.shortDisplayName || '').slice(0, 3).toUpperCase(), logo: logoOf(t),
+    score: c.score == null ? null : (typeof c.score === 'object' ? num(c.score.value ?? c.score.displayValue) : num(c.score)),
+    winner: !!c.winner, record: typeof rec === 'string' && /^\d+-\d+-\d+$/.test(rec) ? rec : null,
   };
 }
-async function sportScoreFixtures(date, league) {
-  const params = { sport:'football', date, limit:200 };
-  if (league && league !== 'all' && LEAGUE_MAP[league]) params.competition = LEAGUE_MAP[league];
-  const data = await getJson(sportScoreUrl('/api/v1/fixtures/', params), `sportscore:fixtures:${date}:${params.competition || 'all'}`);
-  return unwrapArray(data).map(x => normalizeFixture(x, league === 'all' ? null : league));
+function eventOf(ev, league) {
+  const comp = ev.competitions?.[0]; if (!comp) return null;
+  const h = comp.competitors?.find(c => c.homeAway === 'home'), a = comp.competitors?.find(c => c.homeAway === 'away');
+  if (!h || !a) return null;
+  return { id: String(ev.id), league, date: ev.date || comp.date, status: statusOf(ev.status || comp.status), home: teamOf(h), away: teamOf(a) };
 }
 
-function normName(value) {
-  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim();
+/* ---------- ligdeki maç geçmişi (model + form + H2H için) ---------- */
+function scoreboard(slug, a, b) {
+  const dates = a === b ? a : `${a}-${b}`;
+  return getJSON(`${ESPN}/${slug}/scoreboard?dates=${dates}&limit=500`, 3 * 60 * 1000);
 }
-
-async function getSportmonksFallback(playerName, teamName) {
-  if (!SPORTMONKS_TOKEN || !playerName) return null;
-  const searchUrl = new URL(`https://api.sportmonks.com/v3/football/players/search/${encodeURIComponent(playerName)}`);
-  searchUrl.searchParams.set('api_token', SPORTMONKS_TOKEN);
-  const search = await getJson(searchUrl, `sportmonks:player-search:${normName(playerName)}`);
-  const candidates = Array.isArray(search.data) ? search.data : [];
-  const exact = candidates.filter(x => normName(x.display_name || x.name || `${x.firstname || ''} ${x.lastname || ''}`) === normName(playerName));
-  if (exact.length !== 1 || !exact[0].id) return null;
-
-  const playerUrl = new URL(`https://api.sportmonks.com/v3/football/players/${exact[0].id}`);
-  playerUrl.searchParams.set('api_token', SPORTMONKS_TOKEN);
-  playerUrl.searchParams.set('include', 'statistics.details.type;statistics.team');
-  playerUrl.searchParams.set('filters', 'currentSeasons:playerStatistic');
-  const profile = await getJson(playerUrl, `sportmonks:player:${exact[0].id}`);
-  const smPlayer = profile.data || {};
-  const seasons = Array.isArray(smPlayer.statistics) ? smPlayer.statistics : [];
-  if (!seasons.length) return null;
-  const season = seasons.find(x => x.team?.name && teamName && normName(x.team.name) === normName(teamName)) || seasons[0];
-  if (teamName && season.team?.name && normName(season.team.name) !== normName(teamName)) return null;
-
-  const aliases = {
-    appearances: ['appearances', 'matches', 'matches-played'], minutes: ['minutes-played', 'minutes'],
-    goals: ['goals'], assists: ['assists'], shots: ['shots', 'shots-total', 'total-shots'],
-    shots_on_target: ['shots-on-target'], passes: ['passes', 'passes-total'],
-    passes_accuracy: ['passes-accurate', 'accurate-passes'], key_passes: ['key-passes'],
-    dribbles: ['dribbles', 'successful-dribbles'], tackles: ['tackles'],
-    interceptions: ['interceptions'], clearances: ['clearances'],
-    yellow_cards: ['yellowcards', 'yellow-cards'], red_cards: ['redcards', 'red-cards']
-  };
-  const found = {};
-  for (const detail of (season.details || [])) {
-    const code = String(detail.type?.code || detail.type?.name || '').toLowerCase().replace(/_/g, '-');
-    const value = detail.value && typeof detail.value === 'object' ? (detail.value.total ?? detail.value.count ?? detail.value.value) : detail.value;
-    if (value === null || value === undefined || !Number.isFinite(Number(value))) continue;
-    for (const [key, names] of Object.entries(aliases)) if (names.includes(code)) found[key] = Number(value);
-  }
-  return Object.keys(found).length ? { stats: found, player: smPlayer, source: 'Sportmonks' } : null;
-}
-
-function sendStatic(req, res, pathname) {
-  let decoded;
-  try { decoded = decodeURIComponent(pathname); }
-  catch { return fail(res, 400, 'BAD_PATH', 'Geçersiz adres.'); }
-  const relative = decoded === '/' ? 'index.html' : decoded.replace(/^\/+/, '');
-  const file = path.resolve(ROOT, relative);
-  if (file !== ROOT && !file.startsWith(ROOT + path.sep)) return fail(res, 403, 'FORBIDDEN', 'Erişim reddedildi.');
-  fs.readFile(file, (err, bytes) => {
-    if (err) return fail(res, 404, 'NOT_FOUND', 'Dosya bulunamadı.');
-    const ext = path.extname(file).toLowerCase();
-    const types = {
-      '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8',
-      '.css': 'text/css; charset=utf-8', '.json': 'application/json; charset=utf-8',
-      '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.svg': 'image/svg+xml',
-      '.ico': 'image/x-icon', '.webp': 'image/webp', '.woff': 'font/woff', '.woff2': 'font/woff2'
-    };
-    res.writeHead(200, { 'Content-Type': types[ext] || 'application/octet-stream', 'X-Content-Type-Options': 'nosniff' });
-    res.end(bytes);
+function getHistory(slug) {
+  return memoAsync('hist:' + slug, 3 * 3600e3, async () => {
+    const end = Date.now() + 2 * 86400e3, start = end - 440 * 86400e3, step = 55 * 86400e3, jobs = [];
+    for (let t = start; t < end; t += step) jobs.push(scoreboard(slug, ymd(new Date(t)), ymd(new Date(Math.min(t + step - 86400e3, end)))).catch(() => null));
+    const parts = await Promise.all(jobs), seen = new Map();
+    for (const p of parts) for (const ev of p?.events || []) {
+      const e = eventOf(ev, slug); if (e && !seen.has(e.id)) seen.set(e.id, e);
+    }
+    const all = [...seen.values()].map(e => ({ ...e, t: Date.parse(e.date) })).sort((x, y) => x.t - y.t);
+    const done = all.filter(e => e.status.completed && e.home.score != null && e.away.score != null && !/postpon|cancel|aband/i.test(e.status.name));
+    return { all, done };
   });
 }
 
-async function handleApi(req, res, url) {
-  const p = url.pathname;
-  if (p === '/api/health') {
-    return json(res, 200, {
-      app: 'Maç Analiz', version: APP_VERSION, status: 'online',
-      providers: {
-        sportscore: { enabled: true, apiKeyRequired: false, freeTier: true, attributionRequired: true, dailyApproximateLimit: 10000, commercialEarlyStageWithBadge: true },
-        espn: { enabled: false, reason: 'This build uses SportScore instead of ESPN.' },
-        sportmonks: { enabled: Boolean(SPORTMONKS_TOKEN), apiKeyRequired: true, role: 'optional-fallback' },
-        compatibility: { fixtures: true, search: true, matchDetails: false, predictions: false, note: 'Detailed match statistics and Poisson prediction routes require a field-mapping pass against provider payloads.' }
-      },
-      timestamp: new Date().toISOString()
-    });
+/* ---------- Poisson / Dixon-Coles benzeri model ---------- */
+function fitModel(done, refT) {
+  const HL = 150 * 86400e3, ms = done.filter(m => m.t < refT && m.t > refT - 430 * 86400e3);
+  const teams = new Map(); const idx = id => { if (!teams.has(id)) teams.set(id, teams.size); return teams.get(id); };
+  const rows = ms.map(m => ({ h: idx(m.home.id), a: idx(m.away.id), hg: m.home.score, ag: m.away.score, w: Math.pow(0.5, (refT - m.t) / HL) }));
+  const n = teams.size; if (rows.length < 20 || n < 4) return null;
+  const att = new Array(n).fill(1), def = new Array(n).fill(1), games = new Array(n).fill(0);
+  let mu = 1.2, H = 1.25;
+  const sw = rows.reduce((s, r) => s + r.w, 0);
+  mu = rows.reduce((s, r) => s + r.w * r.ag, 0) / sw || 1.2;
+  H = (rows.reduce((s, r) => s + r.w * r.hg, 0) / sw) / mu || 1.25;
+  for (const r of rows) { games[r.h]++; games[r.a]++; }
+  for (let it = 0; it < 40; it++) {
+    const num1 = new Array(n).fill(0), den1 = new Array(n).fill(0);
+    for (const r of rows) {
+      num1[r.h] += r.w * r.hg; den1[r.h] += r.w * mu * H * def[r.a];
+      num1[r.a] += r.w * r.ag; den1[r.a] += r.w * mu * def[r.h];
+    }
+    const k = 0.12 * (den1.reduce((s, v) => s + v, 0) / n);
+    for (let i = 0; i < n; i++) att[i] = (num1[i] + k) / (den1[i] + k);
+    let m = att.reduce((s, v) => s + v, 0) / n; for (let i = 0; i < n; i++) att[i] /= m;
+    const num2 = new Array(n).fill(0), den2 = new Array(n).fill(0);
+    for (const r of rows) {
+      num2[r.a] += r.w * r.hg; den2[r.a] += r.w * mu * H * att[r.h];
+      num2[r.h] += r.w * r.ag; den2[r.h] += r.w * mu * att[r.a];
+    }
+    const k2 = 0.12 * (den2.reduce((s, v) => s + v, 0) / n);
+    for (let i = 0; i < n; i++) def[i] = (num2[i] + k2) / (den2[i] + k2);
+    m = def.reduce((s, v) => s + v, 0) / n; for (let i = 0; i < n; i++) def[i] /= m;
+    let eH = 0, eA = 0, oH = 0, oA = 0;
+    for (const r of rows) { eH += r.w * mu * H * att[r.h] * def[r.a]; eA += r.w * mu * att[r.a] * def[r.h]; oH += r.w * r.hg; oA += r.w * r.ag; }
+    mu *= (oH + oA) / (eH + eA); H *= (oH / eH) / (oA / eA);
   }
+  const rawAvg = ms.reduce((s, m) => s + m.home.score + m.away.score, 0) / ms.length;
+  return { teams, att, def, mu, H, games, matches: ms.length, avgGoals: rawAvg };
+}
+const pois = (l, k) => { let p = Math.exp(-l); for (let i = 1; i <= k; i++) p *= l / i; return p; };
+function scoreMatrix(lh, la, N = 12) {
+  const rho = -0.05, m = [];
+  let tot = 0;
+  for (let i = 0; i < N; i++) { m.push([]); for (let j = 0; j < N; j++) {
+    let p = pois(lh, i) * pois(la, j), tau = 1;
+    if (i === 0 && j === 0) tau = 1 - lh * la * rho; else if (i === 0 && j === 1) tau = 1 + lh * rho;
+    else if (i === 1 && j === 0) tau = 1 + la * rho; else if (i === 1 && j === 1) tau = 1 - rho;
+    p *= Math.max(tau, 0); m[i].push(p); tot += p; } }
+  return m.map(r => r.map(v => v / tot));
+}
+function markets(m) {
+  const N = m.length, o = { home: 0, draw: 0, away: 0, btts: 0, over: {}, homeOver: {}, awayOver: {}, goalDist: new Array(7).fill(0), topScores: [] };
+  const sc = [];
+  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+    const p = m[i][j];
+    if (i > j) o.home += p; else if (i === j) o.draw += p; else o.away += p;
+    if (i > 0 && j > 0) o.btts += p;
+    o.goalDist[Math.min(6, i + j)] += p;
+    if (i < 7 && j < 7) sc.push({ s: `${i}-${j}`, p });
+  }
+  for (const l of ['0.5', '1.5', '2.5', '3.5', '4.5']) { let s = 0; for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) if (i + j > +l) s += m[i][j]; o.over[l] = s; }
+  for (const l of ['0.5', '1.5', '2.5']) { let a = 0, b = 0; for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) { if (i > +l) a += m[i][j]; if (j > +l) b += m[i][j]; } o.homeOver[l] = a; o.awayOver[l] = b; }
+  o.bttsNo = 1 - o.btts; o.dc1X = o.home + o.draw; o.dcX2 = o.draw + o.away; o.dc12 = o.home + o.away;
+  o.homeCleanSheet = m.reduce((s, r) => s + r[0], 0); o.awayCleanSheet = m[0].reduce((s, v) => s + v, 0);
+  o.topScores = sc.sort((a, b) => b.p - a.p).slice(0, 10);
+  return o;
+}
+function formOf(done, teamId, beforeT, n = 6) {
+  return done.filter(m => m.t < beforeT && (m.home.id === teamId || m.away.id === teamId)).slice(-n).map(m => {
+    const own = m.home.id === teamId ? m.home.score : m.away.score, opp = m.home.id === teamId ? m.away.score : m.home.score;
+    return own > opp ? 'W' : own < opp ? 'L' : 'D';
+  });
+}
+function marketFromSummary(s) {
+  const pc = (s.pickcenter || s.odds || [])[0]; if (!pc) return null;
+  const ml = x => { const v = num(x?.moneyLine ?? x?.current?.moneyLine?.american ?? x?.odds?.moneyLine); return v; };
+  const mh = ml(pc.homeTeamOdds), ma = ml(pc.awayTeamOdds), md = ml(pc.drawOdds);
+  if (mh == null || ma == null || md == null) return null;
+  const dec = v => v > 0 ? 1 + v / 100 : 1 + 100 / -v;
+  const dh = dec(mh), dd = dec(md), da = dec(ma), ih = 1 / dh, id = 1 / dd, ia = 1 / da, t = ih + id + ia;
+  return { provider: pc.provider?.name || 'Piyasa', home: ih / t, draw: id / t, away: ia / t, decHome: dh, decDraw: dd, decAway: da, total: num(pc.overUnder), overProb: null };
+}
 
-  try {
-    if (p === '/api/providers') {
-      return json(res, 200, {
-        primary: 'sportscore', fallback: SPORTMONKS_TOKEN ? ['sportmonks'] : [],
-        disabled: ['espn-unlicensed'],
-        notes: ['SportScore free API requires a visible dofollow attribution link on every data-bearing screen.', 'Early-stage commercial use is allowed with attribution under the API-specific terms.', 'Bulk raw-data redistribution and competing-feed mirroring are prohibited.', 'Player detail availability and stat coverage are provider-dependent.']
-      });
-    }
+/* ---------- maç özeti (summary) ayrıştırma ---------- */
+const summaryUrl = (slug, id) => `${ESPN}/${slug}/summary?event=${id}`;
+function getSummary(slug, id, done) { return getJSON(summaryUrl(slug, id), done ? 12 * 3600e3 : 60 * 1000); }
 
-    const fixtureMatch = p.match(/^\/api\/matches\/(\d{8})\/([^/]+)$/);
-    if (fixtureMatch) {
-      const [, compactDate, league] = fixtureMatch;
-      const date = `${compactDate.slice(0,4)}-${compactDate.slice(4,6)}-${compactDate.slice(6,8)}`;
-      const events = await sportScoreFixtures(date, league);
-      return json(res, 200, { events, errors:[], source:'SportScore', generatedAt:new Date().toISOString(), attribution:'https://sportscore.com/' });
-    }
-    if (p === '/api/search') {
-      const q = (url.searchParams.get('q') || '').trim();
-      if (q.length < 2) return json(res, 200, []);
-      const data = await getJson(sportScoreUrl('/api/v1/search/', { q, sport:'football', limit:20 }), `sportscore:search:${q.toLowerCase()}`);
-      const rows = unwrapArray(data);
-      return json(res, 200, rows.map(x => ({
-        id:x.id || x.slug, name:x.name || x.title || x.display_name,
-        league:x.competition_slug || x.league_slug || 'eng.1',
-        teamId:x.team_slug || x.team?.slug || slugify(x.team || ''),
-        slug:x.slug, type:x.type || 'player'
-      })));
-    }
+const STAT_MAP = { // ESPN oyuncu istatistik adı -> arayüz anahtarı
+  totalGoals: 'goals', goalAssists: 'assists', totalShots: 'shots', shotsOnTarget: 'sot', foulsCommitted: 'fouls', foulsSuffered: 'fouled',
+  offsides: 'offsides', yellowCards: 'yc', redCards: 'rc', saves: 'saves', goalsConceded: 'conceded', totalPasses: 'passes', accuratePasses: 'accPasses',
+  keyPasses: 'keyPasses', totalCrosses: 'crosses', accurateCrosses: 'accCrosses', totalLongBalls: 'longBalls', accurateLongBalls: 'accLongBalls',
+  totalTackles: 'tackles', effectiveTackles: 'tacklesWon', wonTackles: 'tacklesWon', interceptions: 'interceptions', totalClearance: 'clearances',
+  effectiveClearance: 'clearances', blockedShots: 'blocks', totalDribbles: 'dribbles', successfulDribbles: 'dribblesWon', wonDribbles: 'dribblesWon',
+  touches: 'touches', possessionLost: 'lostBall', ballRecovery: 'recoveries', totalDuels: 'duels', duelsWon: 'duelsWon', aerialsWon: 'aerialsWon', wonAerials: 'aerialsWon',
+  expectedGoals: 'xg', expectedAssists: 'xa', bigChanceCreated: 'bigChances',
+};
+const subMinute = e => { const m = String(e?.clock?.displayValue ?? e?.clock ?? '').match(/(\d+)(?:'\+(\d+))?/); return m ? Math.min(+m[1] + (m[2] ? +m[2] : 0), 120) : null; };
 
-    if (p === '/api/sportscore/search') {
-      const q = (url.searchParams.get('q') || '').trim();
-      if (q.length < 2) return fail(res, 400, 'QUERY_TOO_SHORT', 'Arama için en az iki karakter gir.');
-      const upstream = sportScoreUrl('/api/v1/search/', { q, sport: 'football', limit: 20 });
-      const data = await getJson(upstream, `sportscore:search:${q.toLowerCase()}`);
-      return json(res, 200, data);
-    }
-    if (p === '/api/sportscore/matches') {
-      const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit') || 20)));
-      const data = await getJson(sportScoreUrl('/api/widget/matches/', { sport: 'football', limit }));
-      return json(res, 200, data);
-    }
-    if (p === '/api/sportscore/fixtures') {
-      const date = url.searchParams.get('date') || new Date().toISOString().slice(0, 10);
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(Date.parse(`${date}T00:00:00Z`))) return fail(res, 400, 'INVALID_DATE', 'Tarih YYYY-AA-GG biçiminde olmalı.');
-      const status = url.searchParams.get('status') || '';
-      if (status && !['live', 'finished', 'upcoming'].includes(status)) return fail(res, 400, 'INVALID_STATUS', 'Durum live, finished veya upcoming olmalı.');
-      const limit = Math.min(200, Math.max(1, Number(url.searchParams.get('limit') || 100)));
-      const data = await getJson(sportScoreUrl('/api/v1/fixtures/', { sport: 'football', date, status, competition: url.searchParams.get('competition'), team: url.searchParams.get('team'), limit }));
-      return json(res, 200, data);
-    }
-    if (p === '/api/sportscore/team') {
-      const slug = (url.searchParams.get('slug') || '').trim();
-      if (!slug || !/^[a-zA-Z0-9-]+$/.test(slug)) return fail(res, 400, 'INVALID_TEAM_SLUG', 'Takım adresi geçersiz.');
-      const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit') || 20)));
-      const data = await getJson(sportScoreUrl('/api/widget/team/', { sport: 'football', slug, limit }));
-      return json(res, 200, data);
-    }
-    if (p === '/api/sportscore/h2h') {
-      const team1 = (url.searchParams.get('team1') || '').trim();
-      const team2 = (url.searchParams.get('team2') || '').trim();
-      if (![team1, team2].every(x => /^[a-zA-Z0-9-]+$/.test(x)) || team1 === team2) return fail(res, 400, 'INVALID_TEAMS', 'İki farklı ve geçerli takım adresi gerekli.');
-      const limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit') || 20)));
-      const data = await getJson(sportScoreUrl('/api/v1/h2h/', { sport: 'football', team1, team2, limit }));
-      return json(res, 200, data);
-    }
-    if (p === '/api/sportscore/match') {
-      const slug = (url.searchParams.get('slug') || '').trim();
-      if (!slug) return fail(res, 400, 'SLUG_REQUIRED', 'Maç adresi bulunamadı.');
-      const data = await getJson(sportScoreUrl('/api/widget/match/', { sport: 'football', slug }));
-      return json(res, 200, data);
-    }
-    if (p === '/api/sportscore/player') {
-      const slug = (url.searchParams.get('slug') || '').trim();
-      if (!slug || slug.length > 180 || !/^[a-zA-Z0-9-]+$/.test(slug)) return fail(res, 400, 'INVALID_PLAYER_SLUG', 'Oyuncu adresi geçersiz.');
-      const data = JSON.parse(JSON.stringify(await getJson(sportScoreUrl('/api/widget/player/', { sport: 'football', slug }))));
-      const player = data.player || data.data?.player || {};
-      const stats = data.stats || data.data?.stats || {};
-      const playerName = player.name || player.display_name || '';
-      const teamName = stats.team || player.team?.name || '';
-      let fallback = null;
-      const wanted = ['shots', 'shots_on_target', 'passes', 'passes_accuracy', 'key_passes', 'dribbles', 'tackles', 'interceptions', 'clearances'];
-      const missing = wanted.some(key => stats[key] === undefined || stats[key] === null);
-      if (missing && SPORTMONKS_TOKEN && playerName) {
-        try { fallback = await getSportmonksFallback(playerName, teamName); } catch (e) { console.warn('Sportmonks fallback unavailable:', e.message); }
-        if (fallback) {
-          const addedFields = [];
-          for (const [key, value] of Object.entries(fallback.stats)) {
-            if (stats[key] === undefined || stats[key] === null) { stats[key] = value; addedFields.push(key); }
-          }
-          data.stats = stats;
-          data._skorzen = { primary: 'SportScore', fallback: addedFields.length ? 'Sportmonks' : null, fallbackFields: addedFields };
+function parseSummary(s) {
+  const comp = s.header?.competitions?.[0];
+  const home = comp?.competitors?.find(c => c.homeAway === 'home'), away = comp?.competitors?.find(c => c.homeAway === 'away');
+  const teamStats = {};
+  for (const t of s.boxscore?.teams || []) {
+    const o = {}; for (const st of t.statistics || []) if (st.name) o[st.name] = st.displayValue ?? st.value;
+    teamStats[String(t.team?.id)] = o;
+  }
+  const keyEvents = (s.keyEvents || []).map((e, i) => ({
+    id: String(e.id ?? i), type: e.type?.type || '', typeText: e.type?.text || '', clock: e.clock?.displayValue || '',
+    teamId: e.team?.id != null ? String(e.team.id) : null, scoring: !!e.scoringPlay,
+    players: (e.participants || []).map(p => p.athlete?.displayName).filter(Boolean), _min: subMinute(e),
+  })).filter(e => e.type);
+  const subs = keyEvents.filter(e => /substitution/i.test(e.type));
+  const rosters = (s.rosters || []).map(r => ({
+    teamId: String(r.team?.id), formation: r.formation || null,
+    players: (r.roster || []).map(p => {
+      const stats = {}, raw = {};
+      for (const st of p.stats || []) if (st.name) { raw[st.name] = num(st.value ?? st.displayValue); }
+      for (const [k, v] of Object.entries(raw)) if (v != null) { stats[k] = v; }
+      const mapped = {}; for (const [k, v] of Object.entries(raw)) if (v != null && STAT_MAP[k]) mapped[STAT_MAP[k]] = v;
+      const starter = !!p.starter, subbedIn = !!p.subbedIn, subbedOut = !!p.subbedOut;
+      let min = null;
+      if (starter || subbedIn) {
+        const sub = subs.find(e => e.teamId === String(r.team?.id) && e.players.some(n => n === p.athlete?.displayName));
+        const end = 90;
+        if (starter) min = subbedOut && sub?._min ? sub._min : end;
+        else min = sub?._min ? Math.max(end - sub._min, 1) : 20;
+        mapped.min = min;
+      }
+      return { id: String(p.athlete?.id), name: p.athlete?.displayName || p.athlete?.fullName || '?', jersey: p.jersey || '', pos: p.position?.abbreviation || '',
+        starter, subbedIn, subbedOut, stats, mapped, played: starter || subbedIn };
+    }),
+  }));
+  return { comp, home, away, teamStats, keyEvents, rosters };
+}
+
+/* ---------- takım verisi: son N maçın özetlerinden ---------- */
+async function teamMatches(slug, teamId, n = 12) {
+  const { done } = await getHistory(slug);
+  const mine = done.filter(m => m.home.id === teamId || m.away.id === teamId).slice(-n);
+  const out = await Promise.all(mine.map(async m => {
+    try { const s = parseSummary(await getSummary(slug, m.id, true)); return { m, s }; } catch { return { m, s: null }; }
+  }));
+  return out;
+}
+function teamPayload(slug, teamId) {
+  return memoAsync(`team:${slug}:${teamId}`, 90 * 60e3, async () => {
+    const { done } = await getHistory(slug);
+    const rows = await teamMatches(slug, teamId, 12);
+    const avgFor = {}, avgAgainst = {}, cntF = {}, cntA = {};
+    const KEYS = ['possessionPct','totalShots','shotsOnTarget','blockedShots','wonCorners','offsides','foulsCommitted','yellowCards','redCards','saves','totalPasses','accuratePasses','totalCrosses','totalLongBalls','totalTackles','interceptions','totalClearance'];
+    let statMatches = 0; const players = new Map();
+    for (const { m, s } of rows) {
+      if (!s) continue;
+      const own = s.teamStats[teamId], opp = s.teamStats[m.home.id === teamId ? m.away.id : m.home.id];
+      if (own && Object.keys(own).length) {
+        statMatches++;
+        for (const k of KEYS) {
+          const a = num(own[k]), b = num(opp?.[k]);
+          if (a != null) { avgFor[k] = (avgFor[k] || 0) + a; cntF[k] = (cntF[k] || 0) + 1; }
+          if (b != null) { avgAgainst[k] = (avgAgainst[k] || 0) + b; cntA[k] = (cntA[k] || 0) + 1; }
         }
       }
-      data._skorzen = data._skorzen || { primary: 'SportScore', fallback: null, note: 'Only missing fields are eligible for fallback; player-name and team checks are applied.' };
-      return json(res, 200, data);
-    }
-    if (p === '/api/sportscore/standings' || p === '/api/sportscore/topscorers' || p === '/api/sportscore/bracket') {
-      const slug = (url.searchParams.get('slug') || '').trim();
-      if (!slug) return fail(res, 400, 'SLUG_REQUIRED', 'Organizasyon adresi bulunamadı.');
-      const endpoint = p.endsWith('/standings') ? '/api/widget/standings/' : p.endsWith('/topscorers') ? '/api/widget/topscorers/' : '/api/widget/bracket/';
-      const params = { sport: 'football', slug };
-      if (endpoint.includes('topscorers')) {
-        params.limit = Math.min(50, Math.max(1, Number(url.searchParams.get('limit') || 20)));
-        params.stat = url.searchParams.get('stat') === 'assists' ? 'assists' : 'goals';
+      const r = s.rosters.find(x => x.teamId === teamId);
+      for (const p of r?.players || []) {
+        if (!p.played && !Object.keys(p.mapped).length) { if (!players.has(p.id)) players.set(p.id, blankPlayer(p)); continue; }
+        const o = players.get(p.id) || blankPlayer(p);
+        if (p.played) { o.apps++; if (p.starter) o.starts++; }
+        for (const k of ['goals','assists','shots','sot','fouls','fouled','yc','rc','saves']) o[k] += p.mapped[k] || 0;
+        o.jersey = p.jersey || o.jersey; o.pos = p.pos || o.pos; players.set(p.id, o);
       }
-      const data = await getJson(sportScoreUrl(endpoint, params));
-      return json(res, 200, data);
     }
-
-    // Compatibility routes consumed by the original Maç Analiz React bundle.
-    const standingsMatch = p.match(/^\/api\/standings\/([^/]+)$/);
-    if (standingsMatch) {
-      const league = standingsMatch[1];
-      const slug = LEAGUE_MAP[league] || league;
-      const raw = await getJson(sportScoreUrl('/api/widget/standings/', { sport:'football', slug }), `sportscore:standings:${slug}`);
-      const body = raw.data || raw;
-      const rows = body.standings || body.table || body.rows || body.groups || [];
-      const groups = Array.isArray(rows) && rows.length && Array.isArray(rows[0]?.rows) ? rows :
-        [{ name: body.name || body.competition || slug, rows: Array.isArray(rows) ? rows : [] }];
-      return json(res, 200, { ...body, groups, season: body.season || body.season_name || null, source:'SportScore' });
-    }
-
-    const matchCompat = p.match(/^\/api\/match\/([^/]+)\/([^/]+)$/);
-    if (matchCompat) {
-      const [, league, id] = matchCompat;
-      const raw = await getJson(sportScoreUrl('/api/widget/match/', { sport:'football', slug:id }), `sportscore:match:${id}`);
-      const body = raw.match || raw.data?.match || raw.data || raw;
-      const homeRaw = body.home || body.home_team || body.homeTeam || {};
-      const awayRaw = body.away || body.away_team || body.awayTeam || {};
-      const homeName = typeof homeRaw === 'string' ? homeRaw : homeRaw.name || body.home_name || 'Ev sahibi';
-      const awayName = typeof awayRaw === 'string' ? awayRaw : awayRaw.name || body.away_name || 'Deplasman';
-      const homeId = slugify(homeRaw.slug || homeRaw.name || homeName);
-      const awayId = slugify(awayRaw.slug || awayRaw.name || awayName);
-      const detail = {
-        ...body, id, league,
-        home: { id:homeId, name:homeName, abbr:homeRaw.short_name || homeName.slice(0,3).toUpperCase(), logo:homeRaw.logo || body.home_logo || null, score:scoreNum(body.home_score ?? body.score?.home) },
-        away: { id:awayId, name:awayName, abbr:awayRaw.short_name || awayName.slice(0,3).toUpperCase(), logo:awayRaw.logo || body.away_logo || null, score:scoreNum(body.away_score ?? body.score?.away) },
-        status: body.status && typeof body.status === 'object' ? body.status : { state:/live|in.?play|1h|2h|half|ht/i.test(String(body.status||''))?'in':/finished|complete|ft|ended/i.test(String(body.status||''))?'post':'pre', completed:/finished|complete|ft|ended/i.test(String(body.status||'')) },
-        keyEvents: body.keyEvents || body.events || body.timeline || [],
-        rosters: body.rosters || body.lineups || [],
-        source:'SportScore'
-      };
-      return json(res, 200, detail);
-    }
-
-    const teamCompat = p.match(/^\/api\/team\/([^/]+)\/([^/]+)$/);
-    if (teamCompat) {
-      const [, league, teamSlug] = teamCompat;
-      const raw = await getJson(sportScoreUrl('/api/widget/team/', { sport:'football', slug:teamSlug, limit:30 }), `sportscore:team:${teamSlug}`);
-      return json(res, 200, raw.data || raw);
-    }
-
-    const matchPlayersCompat = p.match(/^\/api\/match-players\/([^/]+)\/([^/]+)$/);
-    if (matchPlayersCompat) {
-      const [, league, matchSlug] = matchPlayersCompat;
-      const raw = await getJson(sportScoreUrl('/api/widget/match/', { sport:'football', slug:matchSlug }), `sportscore:match:${matchSlug}`);
-      const body = raw.match || raw.data?.match || raw.data || raw;
-      return json(res, 200, body.rosters || body.lineups || body.players || { rosters:[] });
-    }
-
-    const playerCompat = p.match(/^\/api\/player\/([^/]+)\/([^/]+)$/);
-    if (playerCompat) {
-      const [, league, playerSlug] = playerCompat;
-      const raw = await getJson(sportScoreUrl('/api/widget/player/', { sport:'football', slug:playerSlug }), `sportscore:player:${playerSlug}`);
-      return json(res, 200, raw.data || raw);
-    }
-
-    const predictCompat = p.match(/^\/api\/predict\/([^/]+)\/([^/]+)$/);
-    if (predictCompat) {
-      return fail(res, 501, 'PREDICTION_MODEL_NOT_READY',
-        'Bu maç için doğrulanmış geçmiş maç verisi henüz eşleştirilmedi. Gerçek veri olmadan tahmin üretilmedi.');
-    }
-
-    if (p.startsWith('/api/')) return fail(res, 404, 'API_NOT_FOUND', 'Bu API adresi henüz tanımlı değil.');
-  } catch (error) {
-    const status = error.status || (error.name === 'TimeoutError' ? 504 : 502);
-    return fail(res, status, error.code || 'PROVIDER_UNAVAILABLE', error.name === 'TimeoutError' ? 'Veri sağlayıcısı zamanında yanıt vermedi. Biraz sonra tekrar dene.' : error.message || 'Veri sağlayıcısına ulaşılamadı.');
-  }
-  return false;
+    for (const k of KEYS) { if (cntF[k]) avgFor[k] /= cntF[k]; else delete avgFor[k]; if (cntA[k]) avgAgainst[k] /= cntA[k]; else delete avgAgainst[k]; }
+    const roster = await rosterOf(slug, teamId).catch(() => []);
+    for (const a of roster) if (!players.has(a.id)) players.set(a.id, { id: a.id, name: a.name, jersey: a.jersey, pos: a.pos, apps: 0, starts: 0, goals: 0, assists: 0, shots: 0, sot: 0, fouls: 0, fouled: 0, yc: 0, rc: 0, saves: 0 });
+    const games = done.filter(m => m.home.id === teamId || m.away.id === teamId).slice(-20)
+      .map(m => ({ gf: m.home.id === teamId ? m.home.score : m.away.score, ga: m.home.id === teamId ? m.away.score : m.home.score }));
+    return { teamId, statMatches, matchCount: rows.filter(r => r.s).length, avgFor, avgAgainst, matches: games, players: [...players.values()].filter(p => p.name !== '?'), injuries: [] };
+  });
+}
+function blankPlayer(p) { return { id: p.id, name: p.name, jersey: p.jersey, pos: p.pos, apps: 0, starts: 0, goals: 0, assists: 0, shots: 0, sot: 0, fouls: 0, fouled: 0, yc: 0, rc: 0, saves: 0 }; }
+function rosterOf(slug, teamId) {
+  return memoAsync(`roster:${slug}:${teamId}`, 12 * 3600e3, async () => {
+    const d = await getJSON(`${ESPN}/${slug}/teams/${teamId}/roster`, 12 * 3600e3);
+    let list = d.athletes || []; if (list.length && list[0].items) list = list.flatMap(g => g.items);
+    return list.map(a => ({ id: String(a.id), name: a.displayName || a.fullName, jersey: a.jersey || '', pos: a.position?.abbreviation || '', age: a.age ?? null, nation: a.citizenship || a.birthPlace?.country || null, team: d.team }));
+  });
 }
 
-const server = http.createServer(async (req, res) => {
-  const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
-  if (req.method !== 'GET') return fail(res, 405, 'METHOD_NOT_ALLOWED', 'Yalnızca GET destekleniyor.');
-  if (url.pathname.startsWith('/api/')) {
-    const handled = await handleApi(req, res, url);
-    if (handled !== false) return;
-  }
-  sendStatic(req, res, url.pathname);
-});
+/* ---------- API uçları ---------- */
+async function apiMatches(date, league, tz) {
+  const y = +date.slice(0, 4), mo = +date.slice(4, 6) - 1, d = +date.slice(6, 8);
+  const start = Date.UTC(y, mo, d) - tz * 60000, end = start + 86400e3;
+  const a = ymd(new Date(start)), b = ymd(new Date(end - 1));
+  const slugs = league === 'all' ? UI_LEAGUES : [league];
+  const errors = [], events = [];
+  await Promise.all(slugs.map(async slug => {
+    try {
+      const j = await scoreboard(slug, a, b);
+      for (const ev of j.events || []) { const e = eventOf(ev, slug); if (!e) continue; const t = Date.parse(e.date); if (t >= start && t < end) events.push(e); }
+    } catch { errors.push(slug); }
+  }));
+  events.sort((p, q) => Date.parse(p.date) - Date.parse(q.date));
+  return { events, errors: league === 'all' && errors.length > slugs.length - 1 ? errors : errors };
+}
 
-server.listen(PORT, () => console.log(`SKORZEN server listening on http://localhost:${PORT}`));
+async function apiMatch(slug, id) {
+  const raw = await getJSON(summaryUrl(slug, id), 45 * 1000);
+  const s = parseSummary(raw), comp = s.comp; if (!comp || !s.home || !s.away) throw new Error('maç bulunamadı');
+  const hist = await getHistory(slug).catch(() => ({ done: [], all: [] }));
+  const home = teamOf(s.home), away = teamOf(s.away), t = Date.parse(comp.date);
+  const st = statusOf(comp.status);
+  const hf = formOf(hist.done, home.id, t), af = formOf(hist.done, away.id, t);
+  home.form = hf.join(''); away.form = af.join('');
+  const venue = raw.gameInfo?.venue;
+  const lastFive = (raw.boxscore?.form || []).map(f => ({
+    teamId: String(f.team?.id), events: (f.events || []).slice(0, 5).map(e => ({
+      id: String(e.id), result: e.gameResult || '?', atVs: e.atVs || 'vs', opponent: e.opponent?.displayName || '?', opponentLogo: logoOf(e.opponent), score: e.score || '' })) }));
+  for (const tm of [home, away]) if (!lastFive.find(l => l.teamId === tm.id)) {
+    const evs = hist.done.filter(m => m.t < t && (m.home.id === tm.id || m.away.id === tm.id)).slice(-5).reverse().map(m => {
+      const h = m.home.id === tm.id, own = h ? m.home.score : m.away.score, opp = h ? m.away.score : m.home.score, o = h ? m.away : m.home;
+      return { id: m.id, result: own > opp ? 'W' : own < opp ? 'L' : 'D', atVs: h ? 'vs' : '@', opponent: o.name, opponentLogo: o.logo, score: `${m.home.score}-${m.away.score}` };
+    });
+    lastFive.push({ teamId: tm.id, events: evs });
+  }
+  const h2h = hist.done.filter(m => m.t < t && ((m.home.id === home.id && m.away.id === away.id) || (m.home.id === away.id && m.away.id === home.id)))
+    .slice(-5).reverse().map(m => ({ id: m.id, date: m.date, home: m.home.name, away: m.away.name, homeScore: m.home.score, awayScore: m.away.score }));
+  return {
+    id: String(id), league: slug, leagueName: raw.header?.league?.name || slug, date: comp.date, status: st,
+    venue: venue?.fullName || null, city: venue?.address?.city || null, home, away,
+    keyEvents: s.keyEvents.map(({ _min, ...e }) => e), teamStats: s.teamStats,
+    rosters: s.rosters.map(r => ({ teamId: r.teamId, formation: r.formation, players: r.players.map(p => ({ id: p.id, name: p.name, jersey: p.jersey, pos: p.pos, starter: p.starter, subbedIn: p.subbedIn, subbedOut: p.subbedOut, stats: {
+      totalGoals: p.stats.totalGoals ?? 0, goalAssists: p.stats.goalAssists ?? 0, totalShots: p.stats.totalShots ?? 0, shotsOnTarget: p.stats.shotsOnTarget ?? 0,
+      foulsCommitted: p.stats.foulsCommitted ?? 0, foulsSuffered: p.stats.foulsSuffered ?? 0, offsides: p.stats.offsides ?? 0, yellowCards: p.stats.yellowCards ?? 0, redCards: p.stats.redCards ?? 0, saves: p.stats.saves ?? 0 } })) })),
+    lastFive, h2h, generatedAt: new Date().toISOString(),
+  };
+}
+
+async function apiMatchPlayers(slug, id) {
+  const s = parseSummary(await getJSON(summaryUrl(slug, id), 90 * 1000));
+  const teams = {};
+  for (const r of s.rosters) { teams[r.teamId] = {}; for (const p of r.players) if (p.played) teams[r.teamId][p.id] = p.mapped; }
+  return { teams };
+}
+
+async function apiPredict(slug, id) {
+  const raw = await getJSON(summaryUrl(slug, id), 60 * 1000);
+  const s = parseSummary(raw), comp = s.comp; if (!comp || !s.home || !s.away) throw new Error('maç bulunamadı');
+  const hid = String(s.home.team.id), aid = String(s.away.team.id), t = Date.parse(comp.date);
+  const { done } = await getHistory(slug);
+  const fit = fitModel(done, t);
+  if (!fit) throw new Error('Bu lig için model kuracak kadar maç verisi yok');
+  const hi = fit.teams.get(hid), ai = fit.teams.get(aid);
+  if (hi == null || ai == null) throw new Error('Takımlardan biri için yeterli geçmiş maç yok');
+  const lh = fit.mu * fit.H * fit.att[hi] * fit.def[ai], la = fit.mu * fit.att[ai] * fit.def[hi];
+  const m = scoreMatrix(lh, la), mk = markets(m);
+  const strength = i => fit.att[i] / fit.def[i];
+  const order = [...fit.teams.values()].sort((x, y) => strength(y) - strength(x));
+  const st = statusOf(comp.status), hs = num(s.home.score), as = num(s.away.score);
+  return {
+    lambdaHome: lh, lambdaAway: la, markets: mk, matrix: m.slice(0, 7).map(r => r.slice(0, 7)),
+    teams: { home: { att: fit.att[hi], def: fit.def[hi], rank: order.indexOf(hi) + 1, form: formOf(done, hid, t), games: fit.games[hi] },
+             away: { att: fit.att[ai], def: fit.def[ai], rank: order.indexOf(ai) + 1, form: formOf(done, aid, t), games: fit.games[ai] } },
+    league_: { teams: fit.teams.size, matches: fit.matches, avgGoals: fit.avgGoals, homeAdv: fit.H },
+    market: marketFromSummary(raw), actual: st.completed && hs != null && as != null ? { home: hs, away: as } : null,
+  };
+}
+
+async function apiStandings(slug) {
+  const d = await getJSON(`${ESPN_V2}/${slug}/standings`, 30 * 60e3);
+  const kids = d.children?.length ? d.children : [{ name: 'Puan durumu', standings: d.standings }];
+  const groups = kids.map(c => ({
+    name: c.name || 'Puan durumu',
+    rows: (c.standings?.entries || []).map((e, i) => {
+      const st = {}; for (const x of e.stats || []) st[x.name] = x.value;
+      return { teamId: String(e.team.id), name: e.team.displayName, logo: logoOf(e.team), rank: st.rank ?? i + 1, gp: st.gamesPlayed ?? 0, w: st.wins ?? 0, d: st.ties ?? 0, l: st.losses ?? 0,
+        gf: st.pointsFor ?? 0, ga: st.pointsAgainst ?? 0, gd: st.pointDifferential ?? ((st.pointsFor ?? 0) - (st.pointsAgainst ?? 0)), pts: st.points ?? 0,
+        note: e.note?.description || null, noteColor: e.note?.color || null };
+    }).sort((a, b) => a.rank - b.rank),
+  })).filter(g => g.rows.length);
+  return { season: d.season?.displayName || d.seasons?.[0]?.displayName || d.children?.[0]?.standings?.seasonDisplayName || '', groups };
+}
+
+const POS_TR = { G: 'Kaleci', GK: 'Kaleci', D: 'Defans', DF: 'Defans', M: 'Orta saha', MF: 'Orta saha', F: 'Forvet', FW: 'Forvet', CB: 'Defans', LB: 'Defans', RB: 'Defans', CM: 'Orta saha', AM: 'Orta saha', DM: 'Orta saha', LW: 'Forvet', RW: 'Forvet', ST: 'Forvet', CF: 'Forvet' };
+async function apiPlayer(slug, playerId, teamId) {
+  const rows = await teamMatches(slug, teamId, 12);
+  const roster = await rosterOf(slug, teamId).catch(() => []);
+  const info = roster.find(a => a.id === playerId);
+  const tm = rows.find(r => r.s)?.s;
+  const tt = tm ? (tm.home.team.id == teamId ? tm.home.team : tm.away.team) : roster[0]?.team || {};
+  const totals = {}, tracked = {}, matches = []; let apps = 0, minutes = 0, starts = 0, posAbbr = info?.pos || '', name = info?.name, jersey = info?.jersey || '';
+  for (const { m, s } of rows.slice().reverse()) {
+    const isHome = m.home.id === teamId, opp = isHome ? m.away : m.home;
+    const p = s?.rosters.find(r => r.teamId === teamId)?.players.find(x => x.id === playerId);
+    const row = { id: m.id, date: m.date, opponent: opp.name, opponentShort: opp.short, opponentLogo: opp.logo, homeAway: isHome ? 'home' : 'away',
+      gf: isHome ? m.home.score : m.away.score, ga: isHome ? m.away.score : m.home.score, played: !!p?.played, stats: null };
+    if (p) { name = name || p.name; posAbbr = p.pos || posAbbr; jersey = p.jersey || jersey; }
+    if (p?.played) {
+      apps++; if (p.starter) starts++;
+      const st = { ...p.mapped }; minutes += st.min || 0;
+      for (const k of ['goals', 'assists', 'shots', 'sot', 'fouls', 'fouled', 'yc', 'rc', 'saves']) if (st[k] == null) st[k] = 0;
+      for (const [k, v] of Object.entries(st)) { totals[k] = (totals[k] || 0) + v; tracked[k] = (tracked[k] || 0) + 1; }
+      row.stats = st;
+    }
+    matches.push(row);
+  }
+  if (!name) throw new Error('oyuncu bulunamadı');
+  totals.starts = starts;
+  const pa = String(posAbbr || '').toUpperCase();
+  return {
+    player: { id: playerId, name, posAbbr: pa, posTr: POS_TR[pa] || posAbbr || null, jersey, age: info?.age ?? null, nation: info?.nation ?? null, nationFlag: null },
+    team: { id: teamId, name: tt.displayName || '', logo: logoOf(tt) }, apps, minutes, totals, tracked, matches: matches.reverse(),
+    matchesChecked: rows.length, season: new Date().getFullYear().toString(),
+  };
+}
+
+const rosterIndexLeagues = new Set();
+async function apiSearch(q) {
+  const out = []; const ql = q.toLowerCase();
+  try {
+    const d = await getJSON(`${ESPN_SEARCH}?query=${encodeURIComponent(q)}&limit=25&type=player&sport=soccer&lang=en&region=us`, 10 * 60e3);
+    for (const it of d.items || d.results?.[0]?.contents || []) {
+      const lg = it.defaultLeagueSlug || it.league; const rel = it.teamRelationships?.[0]?.core || it.teams?.[0];
+      if (!LEAGUE_OK.has(lg) || !rel?.id) continue;
+      out.push({ id: String(it.id), name: it.displayName || it.name, league: lg, teamId: String(rel.id), team: rel.displayName || '', teamLogo: logoOf(rel) || rel.logos?.[0]?.href || null, pos: it.position || '' });
+    }
+  } catch {}
+  if (!out.length) { // yedek: önbellekteki kadrolarda ara
+    for (const [k, v] of memo) {
+      if (!k.startsWith('roster:')) continue;
+      const [, slug, teamId] = k.split(':');
+      try { for (const a of await v.p) if (a.name?.toLowerCase().includes(ql)) out.push({ id: a.id, name: a.name, league: slug, teamId, team: a.team?.displayName || '', teamLogo: logoOf(a.team), pos: a.pos }); } catch {}
+      if (out.length >= 15) break;
+    }
+  }
+  return out.slice(0, 15);
+}
+
+/* ---------- HTTP ---------- */
+const MIME = { '.html': 'text/html; charset=utf-8', '.js': 'text/javascript; charset=utf-8', '.css': 'text/css; charset=utf-8', '.png': 'image/png', '.svg': 'image/svg+xml',
+  '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.ico': 'image/x-icon' };
+function send(req, res, code, body, type, extra = {}) {
+  const buf = Buffer.isBuffer(body) ? body : Buffer.from(body);
+  const h = { 'content-type': type, ...extra };
+  if (buf.length > 1024 && /gzip/.test(req.headers['accept-encoding'] || '') && /text|json|javascript|svg|manifest/.test(type)) {
+    res.writeHead(code, { ...h, 'content-encoding': 'gzip', vary: 'accept-encoding' }); return res.end(zlib.gzipSync(buf));
+  }
+  res.writeHead(code, h); res.end(buf);
+}
+const json = (req, res, code, obj, cc = 'no-store') => send(req, res, code, JSON.stringify(obj), 'application/json', { 'cache-control': cc });
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const u = new URL(req.url, 'http://x'), p = u.pathname;
+    if (p === '/healthz') return json(req, res, 200, { ok: true });
+    if (p.startsWith('/api/')) {
+      const seg = p.split('/').slice(2).map(decodeURIComponent);
+      const okLeague = l => LEAGUE_OK.has(l), okId = i => /^\d{1,12}$/.test(i || '');
+      try {
+        if (seg[0] === 'matches' && /^\d{8}$/.test(seg[1]) && (seg[2] === 'all' || okLeague(seg[2])))
+          return json(req, res, 200, await apiMatches(seg[1], seg[2], Math.max(-840, Math.min(840, +u.searchParams.get('tz') || 0))));
+        if (seg[0] === 'match' && okLeague(seg[1]) && okId(seg[2])) return json(req, res, 200, await apiMatch(seg[1], seg[2]));
+        if (seg[0] === 'match-players' && okLeague(seg[1]) && okId(seg[2])) return json(req, res, 200, await apiMatchPlayers(seg[1], seg[2]));
+        if (seg[0] === 'predict' && okLeague(seg[1]) && okId(seg[2])) return json(req, res, 200, await apiPredict(seg[1], seg[2]));
+        if (seg[0] === 'team' && okLeague(seg[1]) && okId(seg[2])) return json(req, res, 200, await teamPayload(seg[1], seg[2]));
+        if (seg[0] === 'standings' && okLeague(seg[1])) return json(req, res, 200, await apiStandings(seg[1]));
+        if (seg[0] === 'player' && okLeague(seg[1]) && okId(seg[2]) && okId(u.searchParams.get('team'))) return json(req, res, 200, await apiPlayer(seg[1], seg[2], u.searchParams.get('team')));
+        if (seg[0] === 'search') { const q = (u.searchParams.get('q') || '').trim().slice(0, 60); return json(req, res, 200, q.length >= 2 ? await apiSearch(q) : []); }
+        return json(req, res, 404, { message: 'bulunamadı' });
+      } catch (e) {
+        console.error(p, e.message);
+        return json(req, res, 502, { message: e.message || 'Veri kaynağına ulaşılamadı' });
+      }
+    }
+    let f = path.normalize(path.join(PUBLIC, p === '/' ? 'index.html' : p));
+    if (!f.startsWith(PUBLIC)) { res.writeHead(403); return res.end(); }
+    if (!fs.existsSync(f) || fs.statSync(f).isDirectory()) f = path.join(PUBLIC, 'index.html');
+    const ext = path.extname(f);
+    const cc = f.includes(path.sep + 'assets' + path.sep) ? 'public, max-age=31536000, immutable' : 'no-cache';
+    send(req, res, 200, fs.readFileSync(f), MIME[ext] || 'application/octet-stream', { 'cache-control': cc });
+  } catch (e) { console.error(e); res.writeHead(500); res.end('hata'); }
+});
+server.listen(PORT, () => console.log('Maç Analiz http://localhost:' + PORT));
